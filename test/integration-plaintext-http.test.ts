@@ -111,6 +111,37 @@ describe("pi plaintext bearer guard", () => {
     );
     expect(warn).not.toHaveBeenCalled();
   });
+
+  it("treats IPv6 loopback ([::1]) as loopback (URL parser strips brackets)", () => {
+    const warn = vi.fn();
+    const guard = createPlaintextBearerAuthGuard(warn, {});
+    guard("http://[::1]:3111", "secret");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns for private LAN IPs — RFC1918 ranges are NOT loopback", () => {
+    const warn = vi.fn();
+    const guard = createPlaintextBearerAuthGuard(warn, {});
+    guard("http://192.168.1.50:3111", "secret");
+    guard("http://10.0.0.42:3111", "secret");
+    expect(warn).toHaveBeenCalledTimes(1); // warn-once
+    expect(warn.mock.calls[0][0]).toContain("plaintext HTTP to http://192.168.1.50:3111");
+  });
+
+  it("does not warn when no secret is set — guard only fires when a bearer would actually be sent", () => {
+    const warn = vi.fn();
+    const guard = createPlaintextBearerAuthGuard(warn, {});
+    guard("http://remote.example:3111", "");
+    guard("http://remote.example:3111", undefined);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("treats hostnames that LOOK loopback but aren't (localhost.evil.com) as remote", () => {
+    const warn = vi.fn();
+    const guard = createPlaintextBearerAuthGuard(warn, {});
+    guard("http://localhost.evil.com:3111", "secret");
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("Hermes plaintext bearer guard", () => {
