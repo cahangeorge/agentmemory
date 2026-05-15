@@ -12,6 +12,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -21,6 +22,22 @@ import { fileURLToPath } from "node:url";
 import { homedir, platform } from "node:os";
 import * as p from "@clack/prompts";
 import { generateId } from "./state/schema.js";
+import {
+  buildDiagnostics,
+  dryRunPlan,
+  parseEnvFile,
+  type Diagnostic,
+  type DiagnosticFixResult,
+  type DoctorContext,
+  type DoctorEffects,
+} from "./cli/doctor-diagnostics.js";
+import {
+  buildRemovePlan,
+  formatPlan,
+  localBinIii,
+  type ConnectManifest,
+  type RemoveOptions,
+} from "./cli/remove-plan.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -84,7 +101,11 @@ Commands:
   (default)          Start agentmemory worker
   init               Copy bundled .env.example to ~/.agentmemory/.env if absent
   status             Show connection status, memory count, flags, and health
-  doctor             Run diagnostic checks (server, flags, graph, providers)
+  doctor             Interactive diagnostic + fixer. [F]ix · [S]kip · [?]more · [Q]uit
+                     --all: apply every fix without prompting (CI)
+                     --dry-run: show what each fix would do, don't execute
+  remove             Cleanly uninstall agentmemory (pidfile, state, .env, binaries).
+                     --force: skip confirmations · --keep-data: keep memory data
   demo               Seed sample sessions and show recall in action
   upgrade            Upgrade local deps + iii runtime (best effort)
   stop               Stop the running iii-engine started by this CLI
@@ -838,23 +859,173 @@ function checkClaudeCodeHooks(): CCHooksCheck {
   return { state: "not-loaded" };
 }
 
-async function runDoctor() {
-  p.intro("agentmemory doctor");
+// ---------------------------------------------------------------------------
+// Doctor v2 — interactive fixer.
+//
+// The legacy passive check-list (server reachable, flags, knowledge-graph,
+// Claude Code hooks) still runs first as an informational summary because
+// those checks need a live engine and don't have a one-shot inline fix.
+// Then we drive the new diagnostic catalog (see src/cli/doctor-diagnostics.ts)
+// which prompts Fix/Skip/More/Quit per failing check, applies the fix
+// inline, and re-checks only the affected diagnostic.
+
+function buildDoctorContext(): DoctorContext {
+  return {
+    baseUrl: getBaseUrl(),
+    viewerUrl: getViewerUrl(),
+    envPath: join(homedir(), ".agentmemory", ".env"),
+    pidfilePath: enginePidfilePath(),
+    enginePath: engineStatePath(),
+    pinnedVersion: IIPINNED_VERSION,
+  };
+}
+
+function buildDoctorEffects(): DoctorEffects {
+  return {
+    envFileExists: () => existsSync(join(homedir(), ".agentmemory", ".env")),
+    readEnvFile: () => {
+      try {
+        return parseEnvFile(
+          readFileSync(join(homedir(), ".agentmemory", ".env"), "utf-8"),
+        );
+      } catch {
+        return {};
+      }
+    },
+    pidfileExists: () => existsSync(enginePidfilePath()),
+    pidfilePidIsAlive: () => {
+      const pid = readEnginePidfile();
+      if (pid === null) return null;
+      return pidAlive(pid);
+    },
+    findIiiBinary: () => whichBinary("iii"),
+    localBinIiiPath: () => join(homedir(), ".local", "bin", IS_WINDOWS ? "iii.exe" : "iii"),
+    iiiBinaryVersion: (binPath: string) => iiiBinVersion(binPath),
+    viewerReachable: async (timeoutMs = 2000) => {
+      try {
+        const res = await fetch(getViewerUrl(), {
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        return res.ok;
+      } catch {
+        return false;
+      }
+    },
+    runInit: async () => {
+      try {
+        await runInit();
+        return { ok: true, message: "Wrote ~/.agentmemory/.env" };
+      } catch (err) {
+        return {
+          ok: false,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+    openEditor: async (path: string) => {
+      const editor = process.env["EDITOR"] || process.env["VISUAL"] || "nano";
+      p.log.info(`Opening ${path} in ${editor}…`);
+      try {
+        // Inherit stdio so the user actually sees the editor.
+        const result = spawnSync(editor, [path], { stdio: "inherit" });
+        if (result.error) {
+          return {
+            ok: false,
+            message: `Failed to launch ${editor}: ${result.error.message}`,
+          };
+        }
+        if ((result.status ?? 0) !== 0) {
+          return {
+            ok: false,
+            message: `${editor} exited with code ${result.status}`,
+          };
+        }
+        return { ok: true, message: `Saved ${path}` };
+      } catch (err) {
+        return {
+          ok: false,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+    runIiiInstaller: async () => {
+      const r = await runIiiInstaller();
+      return {
+        ok: r.ok,
+        message: r.ok
+          ? `Installed iii v${IIPINNED_VERSION} to ${r.binPath}`
+          : "iii installer failed (see warnings above)",
+      };
+    },
+    runStop: async () => {
+      try {
+        // runStop calls process.exit on its own — guard against that here
+        // by short-circuiting when there's nothing to stop.
+        const port = getRestPort();
+        const portPids = findEnginePidsByPort(port);
+        const pidfilePid = readEnginePidfile();
+        if (portPids.length === 0 && pidfilePid === null) {
+          clearEnginePidfile();
+          clearEngineState();
+          return { ok: true, message: "Nothing to stop." };
+        }
+        const candidates = new Set<number>();
+        if (pidfilePid) candidates.add(pidfilePid);
+        for (const pid of portPids) candidates.add(pid);
+        let allStopped = true;
+        for (const pid of candidates) {
+          const ok = await signalAndWait(pid, "SIGTERM", 3000);
+          if (!ok) allStopped = false;
+        }
+        clearEnginePidfile();
+        clearEngineState();
+        return {
+          ok: allStopped,
+          message: allStopped ? "Engine stopped." : "Some engine pids survived.",
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+    runStart: async () => {
+      try {
+        const started = await startEngine();
+        if (!started) return { ok: false, message: "startEngine() returned false" };
+        const ready = await waitForEngine(15000);
+        return {
+          ok: ready,
+          message: ready ? "Engine ready" : "Engine did not become ready within 15s",
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+    clearEnginePidAndState: () => {
+      clearEnginePidfile();
+      clearEngineState();
+    },
+  };
+}
+
+async function passiveServerChecks(): Promise<DoctorCheck[]> {
   const base = getBaseUrl();
-  const viewerUrl = getViewerUrl();
   const checks: DoctorCheck[] = [];
 
   const serverUp = await isEngineRunning();
   checks.push({
     name: "Server reachable",
     ok: serverUp,
-    hint: serverUp ? undefined : `Start with: npx @agentmemory/agentmemory (tried ${base})`,
+    hint: serverUp
+      ? undefined
+      : `Start with: npx @agentmemory/agentmemory (tried ${base})`,
   });
-
-  if (!serverUp) {
-    p.note(formatChecks(checks), "server unreachable");
-    process.exit(1);
-  }
+  if (!serverUp) return checks;
 
   const [health, flags, graph] = await Promise.all([
     apiFetch<any>(base, "health", 3000),
@@ -862,40 +1033,46 @@ async function runDoctor() {
     apiFetch<any>(base, "graph/stats", 3000),
   ]);
 
-  const viewerUp = await fetch(viewerUrl, { signal: AbortSignal.timeout(2000) })
-    .then((r) => r.ok)
-    .catch(() => false);
-
   const hasLlm = flags?.provider === "llm";
   const hasEmbed = flags?.embeddingProvider === "embeddings";
-  const graphNodeCount = Number(graph?.totalNodes ?? graph?.nodes ?? graph?.nodeCount ?? 0);
+  const graphNodeCount = Number(
+    graph?.totalNodes ?? graph?.nodes ?? graph?.nodeCount ?? 0,
+  );
   const graphHas = graphNodeCount > 0;
 
   checks.push(
     {
       name: "Health status",
       ok: health?.status === "healthy",
-      hint: health?.status === "healthy" ? undefined : `Status: ${health?.status || "unknown"}`,
-    },
-    {
-      name: "Viewer reachable",
-      ok: viewerUp,
-      hint: viewerUp ? undefined : `${viewerUrl} not responding`,
+      hint:
+        health?.status === "healthy"
+          ? undefined
+          : `Status: ${health?.status || "unknown"}`,
     },
     {
       name: "LLM provider",
       ok: hasLlm,
-      hint: hasLlm ? undefined : "export ANTHROPIC_API_KEY=sk-ant-... (or GEMINI/OPENROUTER/MINIMAX) then restart",
+      hint: hasLlm ? undefined : "set ANTHROPIC_API_KEY (or GEMINI/OPENROUTER/MINIMAX) in ~/.agentmemory/.env",
     },
     {
       name: "Embedding provider",
       ok: hasEmbed,
-      hint: hasEmbed ? undefined : "Running BM25-only. Add OPENAI_API_KEY / VOYAGE_API_KEY / COHERE_API_KEY / OLLAMA_HOST for semantic recall",
+      hint: hasEmbed
+        ? undefined
+        : "Running BM25-only. Add OPENAI_API_KEY / VOYAGE_API_KEY / COHERE_API_KEY / OLLAMA_HOST",
     },
   );
 
-  for (const f of (flags?.flags || []) as { label: string; enabled: boolean; enableHow: string }[]) {
-    checks.push({ name: f.label, ok: f.enabled, hint: f.enabled ? undefined : f.enableHow });
+  for (const f of (flags?.flags || []) as {
+    label: string;
+    enabled: boolean;
+    enableHow: string;
+  }[]) {
+    checks.push({
+      name: f.label,
+      ok: f.enabled,
+      hint: f.enabled ? undefined : f.enableHow,
+    });
   }
 
   const cc = checkClaudeCodeHooks();
@@ -909,12 +1086,14 @@ async function runDoctor() {
       case "not-loaded":
         return {
           ok: false,
-          hint: "Plugin enabled but hooks not loaded by Claude Code. Try: /plugin uninstall agentmemory@agentmemory && /plugin install agentmemory@agentmemory, then restart the session. CC must be >= 2.1.x for plugin-hook auto-load.",
+          hint:
+            "Plugin enabled but hooks not loaded by Claude Code. Try: /plugin uninstall agentmemory@agentmemory && /plugin install agentmemory@agentmemory, then restart the session.",
         };
       case "no-debug-log":
         return {
           ok: false,
-          hint: "Cannot verify — no Claude Code debug log found. Run once with `claude --debug -p \"x\"`, then re-run doctor.",
+          hint:
+            'Cannot verify — no Claude Code debug log found. Run once with `claude --debug -p "x"`, then re-run doctor.',
         };
       case "no-cc-dir":
         return undefined;
@@ -925,19 +1104,154 @@ async function runDoctor() {
   checks.push({
     name: "Knowledge graph populated",
     ok: graphHas,
-    hint: graphHas ? undefined : "Graph is empty. Run a session with GRAPH_EXTRACTION_ENABLED=true, or POST /agentmemory/graph/extract",
+    hint: graphHas
+      ? undefined
+      : "Graph is empty. Run a session with GRAPH_EXTRACTION_ENABLED=true.",
   });
 
-  const passed = checks.filter((c) => c.ok).length;
-  const total = checks.length;
-  p.note(formatChecks(checks), `${passed}/${total} checks passing`);
+  return checks;
+}
 
-  if (passed === total) {
-    p.outro("✓ All checks passed. agentmemory is healthy.");
+type DoctorAction = "fix" | "skip" | "more" | "quit";
+
+async function askFixAction(d: Diagnostic): Promise<DoctorAction> {
+  const choice = await p.select<DoctorAction>({
+    message: `[${d.id}] ${d.message}`,
+    options: [
+      { value: "fix", label: "F  Fix", hint: d.fixPreview },
+      { value: "skip", label: "S  Skip" },
+      { value: "more", label: "?  More info" },
+      { value: "quit", label: "Q  Quit doctor" },
+    ],
+    initialValue: "fix",
+  });
+  if (p.isCancel(choice)) return "quit";
+  return choice;
+}
+
+async function applyFixWithReport(
+  d: Diagnostic,
+  ctx: DoctorContext,
+  dryRun: boolean,
+): Promise<DiagnosticFixResult> {
+  if (dryRun) {
+    p.log.info(`[dry-run] would: ${d.fixPreview}`);
+    return { ok: true, message: "(dry-run)" };
+  }
+  const result = await d.fix(ctx);
+  if (result.ok) {
+    p.log.success(result.message ?? `${d.id} fixed.`);
   } else {
-    p.outro(`${total - passed} issue(s) — follow hints above to fix.`);
+    p.log.error(result.message ?? `${d.id} fix failed.`);
+  }
+  return result;
+}
+
+async function runDoctor() {
+  p.intro("agentmemory doctor");
+  const applyAll = args.includes("--all");
+  const dryRun = args.includes("--dry-run");
+  if (applyAll && dryRun) {
+    p.log.error("Cannot combine --all and --dry-run.");
+    process.exit(2);
+  }
+
+  // Passive server checks (informational).
+  const passive = await passiveServerChecks();
+  const passivePassed = passive.filter((c) => c.ok).length;
+  p.note(formatChecks(passive), `server: ${passivePassed}/${passive.length} passing`);
+
+  // Doctor v2 interactive catalog.
+  const ctx = buildDoctorContext();
+  const effects = buildDoctorEffects();
+  const diagnostics = buildDiagnostics(effects);
+
+  if (dryRun) {
+    const results: Array<{ diagnostic: Diagnostic; status: { ok: boolean; detail?: string } }> = [];
+    for (const d of diagnostics) results.push({ diagnostic: d, status: await d.check(ctx) });
+    const lines = dryRunPlan(ctx, results);
+    p.note(lines.join("\n"), "dry-run plan");
+    p.outro("Dry-run complete. Re-run without --dry-run to apply.");
+    return;
+  }
+
+  let failed = 0;
+  let fixed = 0;
+  let skipped = 0;
+  let quit = false;
+
+  for (const d of diagnostics) {
+    if (quit) {
+      skipped++;
+      continue;
+    }
+    const status = await d.check(ctx);
+    if (status.ok) {
+      p.log.success(`${d.id} ✓${status.detail ? ` (${status.detail})` : ""}`);
+      continue;
+    }
+    failed++;
+    p.log.warn(`${d.id} ✗ ${status.detail ?? ""}`.trim());
+    p.log.info(`why: ${d.fixPreview}`);
+
+    if (d.manualOnly) {
+      p.log.info(`(manual fix only — see "${d.id}" docs)`);
+    }
+
+    if (applyAll) {
+      const r = await applyFixWithReport(d, ctx, false);
+      if (r.ok) fixed++;
+      // Re-check only this diagnostic.
+      const after = await d.check(ctx);
+      if (!after.ok) p.log.warn(`${d.id} still failing after fix.`);
+      continue;
+    }
+
+    // Interactive prompt loop — allow [?] More info without leaving the check.
+    while (true) {
+      const action = await askFixAction(d);
+      if (action === "fix") {
+        const r = await applyFixWithReport(d, ctx, false);
+        if (r.ok) {
+          const after = await d.check(ctx);
+          if (after.ok) {
+            fixed++;
+          } else {
+            p.log.warn(`${d.id} still failing after fix: ${after.detail ?? ""}`);
+          }
+        }
+        break;
+      }
+      if (action === "skip") {
+        skipped++;
+        break;
+      }
+      if (action === "more") {
+        p.note(d.moreInfo, `[${d.id}] more info`);
+        continue;
+      }
+      if (action === "quit") {
+        quit = true;
+        break;
+      }
+    }
+  }
+
+  const summary = `${diagnostics.length} checks · ${failed} failing · ${fixed} fixed · ${skipped} skipped`;
+  if (quit) {
+    p.outro(`Quit early. ${summary}`);
     process.exit(1);
   }
+  if (failed === 0) {
+    p.outro("All diagnostics passing. agentmemory is healthy.");
+    return;
+  }
+  if (failed - fixed === 0) {
+    p.outro(`All fixes applied. ${summary}`);
+    return;
+  }
+  p.outro(summary);
+  process.exit(1);
 }
 
 type DemoObservation = {
@@ -1714,6 +2028,148 @@ async function runImportJsonl(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// `agentmemory remove` — clean uninstall.
+//
+// Planning logic lives in src/cli/remove-plan.ts so it's testable without
+// touching $HOME. This function loads the manifest, builds the plan,
+// double-confirms, then executes step by step.
+
+function loadConnectManifest(home: string): ConnectManifest | null {
+  const path = join(home, ".agentmemory", "backups", "connect-manifest.json");
+  try {
+    const raw = readFileSync(path, "utf-8");
+    const parsed = JSON.parse(raw) as Partial<ConnectManifest>;
+    if (Array.isArray(parsed?.installed)) {
+      return { installed: parsed.installed };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function probeLocalBinIiiVersion(home: string): string | null {
+  const path = localBinIii(home);
+  if (!existsSync(path)) return null;
+  return iiiBinVersion(path);
+}
+
+function safeDelete(path: string): { ok: boolean; message: string } {
+  try {
+    if (!existsSync(path)) return { ok: true, message: `not present (${path})` };
+    const st = statSync(path);
+    if (st.isDirectory()) {
+      rmSync(path, { recursive: true, force: true });
+    } else {
+      unlinkSync(path);
+    }
+    return { ok: true, message: `deleted ${path}` };
+  } catch (err) {
+    return {
+      ok: false,
+      message: `failed ${path}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+async function runRemove(): Promise<void> {
+  p.intro("agentmemory remove");
+  const force = args.includes("--force");
+  const keepData = args.includes("--keep-data");
+
+  const home = homedir();
+  const connectManifest = loadConnectManifest(home);
+  const localBinIiiVersion = probeLocalBinIiiVersion(home);
+
+  const options: RemoveOptions = { force, keepData };
+  const plan = buildRemovePlan(
+    {
+      home,
+      pinnedVersion: IIPINNED_VERSION,
+      localBinIiiVersion,
+      connectManifest,
+    },
+    options,
+  );
+
+  const applicable = plan.filter((it) => it.applicable);
+  if (applicable.length === 0) {
+    p.outro("Nothing to remove. agentmemory is already gone.");
+    return;
+  }
+
+  p.note(formatPlan(plan), "destruction plan");
+
+  if (!force) {
+    const proceed = await p.confirm({
+      message: "Proceed with these deletions?",
+      initialValue: false,
+    });
+    if (p.isCancel(proceed) || proceed !== true) {
+      p.cancel("Cancelled. Nothing was deleted.");
+      return;
+    }
+    const sure = await p.confirm({
+      message: "This is irreversible. Continue?",
+      initialValue: false,
+    });
+    if (p.isCancel(sure) || sure !== true) {
+      p.cancel("Cancelled. Nothing was deleted.");
+      return;
+    }
+  }
+
+  for (const item of plan) {
+    if (!item.applicable) continue;
+
+    // alwaysAsk items get a per-item confirmation even with --force.
+    if (item.alwaysAsk) {
+      const ok = await p.confirm({
+        message: `${item.description} — really delete${item.path ? ` ${item.path}` : ""}?`,
+        initialValue: false,
+      });
+      if (p.isCancel(ok) || ok !== true) {
+        p.log.info(`skipped: ${item.id}`);
+        continue;
+      }
+    }
+
+    if (item.id === "stop-engine") {
+      try {
+        const port = getRestPort();
+        const portPids = findEnginePidsByPort(port);
+        const pidfilePid = readEnginePidfile();
+        const cands = new Set<number>();
+        if (pidfilePid) cands.add(pidfilePid);
+        for (const pid of portPids) cands.add(pid);
+        for (const pid of cands) await signalAndWait(pid, "SIGTERM", 3000);
+        clearEnginePidfile();
+        clearEngineState();
+        p.log.success(
+          cands.size > 0
+            ? `stopped engine (${cands.size} pid${cands.size === 1 ? "" : "s"})`
+            : "no engine running",
+        );
+      } catch (err) {
+        p.log.warn(
+          `engine stop best-effort: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      continue;
+    }
+
+    if (!item.path) continue;
+    const r = safeDelete(item.path);
+    if (r.ok) p.log.success(r.message);
+    else p.log.error(r.message);
+  }
+
+  p.outro(
+    "Done. agentmemory cleanly removed. The npm package itself: npm uninstall -g @agentmemory/agentmemory",
+  );
+}
+
 const commands: Record<string, () => Promise<void>> = {
   init: runInit,
   status: runStatus,
@@ -1721,6 +2177,7 @@ const commands: Record<string, () => Promise<void>> = {
   demo: runDemo,
   upgrade: runUpgrade,
   stop: runStop,
+  remove: runRemove,
   mcp: runMcp,
   "import-jsonl": runImportJsonl,
 };
